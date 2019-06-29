@@ -1,0 +1,12 @@
+{
+    "version" : "1.0.0",
+    "project" : {
+	"name" : {NAME},
+        "directory" : {DIRECTORY},
+	"sources" : {SOURCES},
+        "dependencies" : {DEPENDENCIES},
+	"classpath" : {CLASSPATH},
+        "out" : {OUT},
+        "classesDir" : {CLASSES_DIR}
+    }
+}
