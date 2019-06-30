@@ -8,5 +8,6 @@
 	"classpath" : {CLASSPATH},
         "out" : {OUT},
         "classesDir" : {CLASSES_DIR}
+	{SCALA_BLOB}
     }
 }

@@ -1,53 +1,65 @@
 _BloopyInfo = provider(fields = [
     "bloopies",
-    "json_files",
 ])
 
-def _bloopy_java_import(target, ctx):
+def _get_scala_version(target, ctx):
+    # this is a total hack
     java_info = target[JavaInfo]
-    return struct(
-        jars = java_info.full_compile_jars.to_list(),
-        deps = [],
-        srcs = [],
-    )
+    scala_jars = [
+        dep
+        for dep in java_info.transitive_runtime_deps
+        if dep.is_source and "rules_scala" in dep.owner.workspace_name
+    ]
+    if len(scala_jars) == 0:
+        return None
+
+    print(scala_jars)
+
+    res = scala_jars[0].basename
+    res = res[:res.rfind('.')]
+    res = res[res.rfind('-') + 1:]
+    return res
 
 def _bloopy_java_binary(target, ctx):
-    java_info = target[JavaInfo]
     return struct(
         jars = [],
         deps = ctx.rule.attr.deps,
         srcs = ctx.rule.attr.srcs,
+        scala = None
     )
 
 def _bloopy_java_library(target, ctx):
-    java_info = target[JavaInfo]
     return struct(
         jars = [],
         deps = [],
         srcs = ctx.rule.attr.srcs,
-    )
-
-def _bloopy_scala_import(target, ctx):
-    print("SCALA_IMPORT :: NOT IMPLEMENTED YET")
-    return struct(
-        jars = [],
-        deps = [],
-        srcs = [],
+        scala = None
     )
 
 def _bloopy_scala_library(target, ctx):
-    print("SCALA_LIBRAY :: NOT IMPLEMENTED YET")
+    java_info = target[JavaInfo]
     return struct(
-        jars = [],
-        deps = [],
-        srcs = [],
+        jars = [dep for dep in java_info.transitive_runtime_deps if dep.is_source],
+        deps = ctx.rule.attr.deps,
+        srcs = ctx.rule.attr.srcs,
+        scala = _get_scala_version(target, ctx)
+    )
+
+def _bloopy_scala_binary(target, ctx):
+    java_info = target[JavaInfo]
+    return struct(
+        jars = [dep for dep in java_info.transitive_runtime_deps if dep.is_source],
+        deps = ctx.rule.attr.deps,
+        srcs = ctx.rule.attr.srcs,
+        scala = _get_scala_version(target, ctx)
     )
 
 _bloopy_maker = {
     'java_binary': _bloopy_java_binary,
-    'java_import': _bloopy_java_import,
+    #'java_import': _bloopy_java_import,
     'java_library': _bloopy_java_library,
-    'scala_import': _bloopy_scala_import,
+    'scala_binary': _bloopy_scala_binary,
+    #'scala_import': _bloopy_scala_import,
     'scala_library': _bloopy_scala_library,
 }
 
@@ -73,40 +85,8 @@ def _bloop_aspect_impl(target, ctx):
         parents.extend(ctx.rule.attr.runtime_deps)
 
     bloopies_depset_items = None
-    json_files_depset_items = None
     if bloopy != None:
-        ROOT = "@@ROOT@@"
-        label_basename = _smash_label_to_basename(ctx.label)
-        json_file_name = "bloop-%s.json" % label_basename
-        json_file = ctx.actions.declare_file(json_file_name)
-        ctx.actions.expand_template(
-            template = ctx.file._module_json_template,
-            output = json_file,
-            substitutions = {
-                "{NAME}": _quote(label_basename),
-                "{DIRECTORY}": _quote("%s%s" % (ROOT, ctx.label.package)),
-                "{SOURCES}": _quote_list([
-                    "%s%s" % (ROOT, f.path)
-                    for t in bloopy.srcs
-                    for f in t.files.to_list()
-                ]),
-                "{DEPENDENCIES}": _quote_list([_smash_label_to_basename(t.label) for t in bloopy.deps]),
-                "{CLASSPATH}": _quote_list(
-                    [
-                        ".bloop/%s/classes" % _smash_label_to_basename(t.label)
-                         for t in bloopy.deps
-                    ] + [
-                        j.path
-                        for j in bloopy.jars
-                    ]
-                ),
-                "{OUT}": _quote(".bloop/%s" % label_basename),
-                "{CLASSES_DIR}": _quote(".bloop/%s/classes" % label_basename),
-            },
-        )
-
         bloopies_depset_items = [(ctx.label, bloopy)]
-        json_files_depset_items = [(ctx.label, json_file)]
 
     return [
         _BloopyInfo(
@@ -117,30 +97,13 @@ def _bloop_aspect_impl(target, ctx):
                     for parent in parents
                     if _BloopyInfo in parent
                 ],
-            ),
-            json_files = depset(
-                items = json_files_depset_items,
-                transitive = [
-                    parent[_BloopyInfo].json_files
-                    for parent in parents
-                    if _BloopyInfo in parent
-                ],
-            ),
-        ),
-        OutputGroupInfo(
-            bloop = [f for (l, f) in json_files_depset_items],
-        ),
+            )
+        )
     ]
 
 bloop_aspect = aspect(
     implementation = _bloop_aspect_impl,
     attr_aspects = ["exports", "deps", "dep", "runtime_deps"],
-    attrs = {
-        "_module_json_template": attr.label(
-            default = Label("//bloop/private:module-template.json"),
-            allow_single_file = True,
-        ),
-    },
 )
 
 def _arg_quoted(filename, protect = "="):
@@ -162,8 +125,62 @@ def _quote_list(l):
     return "[%s]" % guts
 
 
+def _make_bloop_json(ctx, label, bloopy):
+    label_basename = _smash_label_to_basename(label)
+    json_file_name = "bloop-%s.json" % label_basename
+    json_file = ctx.actions.declare_file(json_file_name)
+
+    more_files = []
+    more_files.extend(bloopy.jars)
+
+    scala_blob = ""
+    if bloopy.scala != None:
+        scala_blob = ', "scala" : ' + struct(
+            organization = "org.scala-lang",
+            name = "scala-compiler",
+            version = bloopy.scala,
+            jars = [
+                "@@RUNFILES_ROOT@@/%s" % j.path
+                for j in ctx.files.bazelbuild_rules_scala_compiler_jars
+            ],
+            options = [],
+        ).to_json()
+
+    ctx.actions.expand_template(
+        template = ctx.file._module_json_template,
+        output = json_file,
+        substitutions = {
+            "{NAME}": _quote(label_basename),
+            "{DIRECTORY}": _quote("@@WORKSPACE_ROOT@@/%s" % label.package),
+            "{SOURCES}": _quote_list([
+                "@@WORKSPACE_ROOT@@/%s" % f.path
+                for t in bloopy.srcs
+                for f in t.files.to_list()
+            ]),
+            "{DEPENDENCIES}": _quote_list([_smash_label_to_basename(t.label) for t in bloopy.deps]),
+            "{CLASSPATH}": _quote_list(
+                [
+                    ".bloop/%s/classes" % _smash_label_to_basename(t.label)
+                    for t in bloopy.deps
+                ] + [
+                    "@@RUNFILES_ROOT@@/%s" % j.path
+                    for j in bloopy.jars
+                ]
+            ),
+            "{OUT}": _quote(".bloop/%s" % label_basename),
+            "{CLASSES_DIR}": _quote(".bloop/%s/classes" % label_basename),
+            "{SCALA_BLOB}": scala_blob
+        },
+    )
+
+    return (json_file, more_files)
+
 _SCRIPT_TEMPLATE = """#!/usr/bin/env bash
+set -e
+
+RUNFILES_ROOT=$PWD
 cd $BUILD_WORKSPACE_DIRECTORY
+WORKSPACE_ROOT=$PWD
 mkdir -p .bloop
 
 echo "Copying bloop files..."
@@ -175,22 +192,30 @@ echo "Copying bloop files..."
 
 def _bloop_implementation(ctx):
 
+    all_files = []
     json_files = []
     for target in ctx.attr.targets:
         if _BloopyInfo in target:
-            for (label, json_file) in target[_BloopyInfo].json_files.to_list():
+            for (label, bloopy) in target[_BloopyInfo].bloopies.to_list():
+                (json_file, more_files) = _make_bloop_json(ctx, label, bloopy)
                 json_files.append(json_file)
+                all_files.extend(more_files)
+
+    all_files.extend(ctx.files.bazelbuild_rules_scala_compiler_jars)
+    all_files.extend(json_files)
+
+    print(ctx.var)
 
     script = ctx.actions.declare_file(ctx.label.name)
     script_content = _SCRIPT_TEMPLATE.format(
         COPY_FILES = "\n".join([
-            'sed "s?@@ROOT@@?$PWD/?" %s > .bloop/%s' % (f.path, f.basename)
+            'sed "s?@@WORKSPACE_ROOT@@?$WORKSPACE_ROOT/?g" %s | sed "s?@@RUNFILES_ROOT@@?$RUNFILES_ROOT/?g" > .bloop/%s' % (f.path, f.basename)
             for f in json_files
         ]),
     )
     ctx.actions.write(script, script_content, is_executable = True)
 
-    runfiles = ctx.runfiles(files = json_files)
+    runfiles = ctx.runfiles(files = all_files)
     return [
         DefaultInfo(
             executable = script,
@@ -206,11 +231,13 @@ bloop = rule(
             aspects = [bloop_aspect],
             default = [],
         ),
-        "_build_tar": attr.label(
-            default = Label("@bazel_tools//tools/build_defs/pkg:build_tar"),
-            cfg = "host",
-            executable = True,
+        "bazelbuild_rules_scala_compiler_jars": attr.label_list(
+            mandatory = False,
             allow_files = True,
+        ),
+        "_module_json_template": attr.label(
+            default = Label("//bloop/private:module-template.json"),
+            allow_single_file = True,
         ),
     },
     executable = True,
